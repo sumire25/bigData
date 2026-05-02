@@ -1,0 +1,10 @@
+plugin: amazon.aws.aws_ec2
+regions:
+  - us-east-1
+hostnames:
+  - ip-address
+strict: False
+keyed_groups:
+  - key: tags.Role
+    separator: ""
+    prefix: ""

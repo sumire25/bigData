@@ -1,0 +1,6 @@
+<configuration>
+    <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://{{ hostvars[groups['master'][0]]['ansible_default_ipv4']['address'] }}:9000</value>
+    </property>
+</configuration>

@@ -1,0 +1,222 @@
+---
+# ==========================================================
+# NEW: Pre-Flight Polling (Replaces bash sleep)
+# ==========================================================
+- name: Phase 0 - Wait for Servers to Boot
+  hosts: all
+  gather_facts: no # CRITICAL: Do not try to gather facts until SSH is up
+  tasks:
+    - name: Dynamically wait for SSH port to open
+      wait_for_connection:
+        delay: 5        # Wait 30 seconds before first try
+        sleep: 5        # Try every 5 seconds
+        timeout: 300    # Give up after 5 minutes
+
+# ==========================================================
+# Upgraded Phase 1 - Base Software
+# ==========================================================
+- name: Phase 1 - Install Base Software
+  hosts: all
+  become: yes
+  any_errors_fatal: true
+  tasks:
+    - name: Wait for any unattended apt processes to finish
+      shell: while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done;
+      changed_when: false # <--- FIX 1: Tells Ansible this doesn't change the server state
+
+    - name: Update apt cache and install Java
+      # Run apt-get clean and update before installing to fix corrupted lists
+      shell: rm -rf /var/lib/apt/lists/* && apt-get clean && apt-get update -y
+      changed_when: false
+
+    - name: Install OpenJDK 11
+      apt:
+        name: openjdk-11-jdk-headless
+        state: present
+        update_cache: yes
+
+    # NEW FIX 2: Check if Hadoop is already fully installed
+    - name: Check if Hadoop is already installed
+      stat:
+        path: /usr/local/hadoop/bin/hadoop
+      register: hadoop_check
+
+    # NEW FIX 3: Add 'when' to skip these tasks if Hadoop is present
+    - name: Download Hadoop archive
+      get_url:
+        url: https://archive.apache.org/dist/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz
+        dest: /tmp/hadoop-3.3.6.tar.gz
+        timeout: 120
+      register: download_result
+      until: download_result is succeeded
+      retries: 3
+      delay: 10
+      when: not hadoop_check.stat.exists
+
+    - name: Extract Hadoop
+      unarchive:
+        src: /tmp/hadoop-3.3.6.tar.gz
+        dest: /usr/local/
+        remote_src: yes
+      when: not hadoop_check.stat.exists
+
+    - name: Clean up archive
+      file:
+        path: /tmp/hadoop-3.3.6.tar.gz
+        state: absent
+      when: not hadoop_check.stat.exists
+
+    - name: Rename and set ownership
+      shell: |
+        if [ -d "/usr/local/hadoop-3.3.6" ]; then
+          mv /usr/local/hadoop-3.3.6 /usr/local/hadoop
+        fi
+        chown -R ubuntu:ubuntu /usr/local/hadoop
+      args:
+        creates: /usr/local/hadoop/bin/hadoop
+
+- name: Phase 2 - Automate SSH Keys
+  hosts: master
+  become: no
+  tasks:
+    # NEW: Disable SSH security prompts for internal Hadoop communication
+    - name: Disable StrictHostKeyChecking for Hadoop
+      copy:
+        dest: /home/ubuntu/.ssh/config
+        content: |
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+        mode: '0600'
+        
+    - name: Generate SSH key on Master
+      openssh_keypair:
+        path: ~/.ssh/id_rsa
+        type: rsa
+
+    - name: Fetch Master public key
+      fetch:
+        src: ~/.ssh/id_rsa.pub
+        dest: /tmp/master_key.pub
+        flat: yes
+
+- name: Phase 3 - Inject SSH Key into Workers
+  hosts: all
+  become: no
+  any_errors_fatal: true
+  tasks:
+    - name: Add Master key to Workers
+      authorized_key:
+        user: ubuntu
+        state: present
+        key: "{{ lookup('file', '/tmp/master_key.pub') }}"
+
+- name: Phase 4 - Configure Cluster
+  hosts: all
+  become: yes
+  any_errors_fatal: true
+  tasks:
+    - name: Create HDFS directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+      loop:
+        - /usr/local/hadoop/hdfs/namenode
+        - /usr/local/hadoop/hdfs/datanode
+
+    - name: Copy XML configurations
+      template:
+        src: "templates/{{ item }}"
+        dest: "/usr/local/hadoop/etc/hadoop/{{ item }}"
+        owner: ubuntu
+      loop:
+        - core-site.xml
+        - hdfs-site.xml
+        - mapred-site.xml
+        - yarn-site.xml
+
+    - name: Generate dynamic workers file
+      template:
+        src: templates/workers.j2
+        dest: /usr/local/hadoop/etc/hadoop/workers
+        owner: ubuntu
+        
+    - name: Hardcode Java and RAM limits in hadoop-env.sh
+      blockinfile:
+        path: /usr/local/hadoop/etc/hadoop/hadoop-env.sh
+        block: |
+          export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+          export HADOOP_HEAPSIZE=400
+          export HDFS_NAMENODE_HEAPSIZE=400
+          export HDFS_SECONDARYNAMENODE_HEAPSIZE=300
+        marker: "# {mark} ANSIBLE MANAGED HDFS CONFIGS"
+        
+    - name: Set JAVA_HOME in yarn-env.sh
+      lineinfile:
+        path: /usr/local/hadoop/etc/hadoop/yarn-env.sh
+        regexp: '^#? ?export JAVA_HOME='
+        line: 'export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64'
+        
+    - name: Hardcode YARN RAM limits in yarn-env.sh
+      blockinfile:
+        path: /usr/local/hadoop/etc/hadoop/yarn-env.sh
+        block: |
+          export YARN_RESOURCEMANAGER_HEAPSIZE=512
+          export YARN_NODEMANAGER_HEAPSIZE=512
+        marker: "# {mark} ANSIBLE MANAGED YARN HEAP LIMITS"
+        
+    - name: Add Hadoop to PATH in .bashrc
+      blockinfile:
+        path: /home/ubuntu/.bashrc
+        block: |
+          export HADOOP_HOME=/usr/local/hadoop
+          export PATH=$PATH:$HADOOP_HOME/bin:$HADOOP_HOME/sbin
+        marker: "# {mark} ANSIBLE MANAGED HADOOP PATH"
+
+# ==========================================================
+# Upgraded Phase 5 - Format, Start, and Validate
+# ==========================================================
+- name: Phase 5 - Format, Start, and Health Check
+  hosts: master
+  become: no
+  tasks:
+    - name: Format Namenode
+      shell: /usr/local/hadoop/bin/hdfs namenode -format -nonInteractive
+      args:
+        creates: /usr/local/hadoop/hdfs/namenode/current
+
+    - name: Start HDFS
+      shell: bash -lc "/usr/local/hadoop/sbin/start-dfs.sh"
+
+    - name: Wait dynamically for HDFS to open RPC Port 9000
+      wait_for:
+        host: "{{ ansible_default_ipv4.address }}"  # <--- NEW: Check the private IP!
+        port: 9000
+        state: started
+        timeout: 60
+        msg: "HDFS NameNode did not bind to port 9000 in time."
+
+    - name: Start YARN
+      shell: /usr/local/hadoop/sbin/start-yarn.sh
+      environment:
+        HADOOP_HOME: /usr/local/hadoop
+        HADOOP_CONF_DIR: /usr/local/hadoop/etc/hadoop
+        # forcefully inject the bin/sbin paths so Ansible cannot lose them
+        PATH: "/usr/local/hadoop/bin:/usr/local/hadoop/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+    - name: Verify ResourceManager UI is listening on port 8088
+      wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 8088
+        state: started
+        timeout: 120
+        msg: "Hadoop ResourceManager failed to start on port 8088"
+
+    - name: Verify NameNode UI is listening on port 9870
+      wait_for:
+        port: 9870
+        state: started
+        timeout: 120
+        msg: "Hadoop NameNode failed to start on port 9870"
