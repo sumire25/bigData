@@ -1,0 +1,85 @@
+version: '3.8'
+
+networks:
+  bigdata-net:
+    driver: bridge
+
+services:
+  # --- MINIO (LOCAL S3 STORAGE) ---
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"       # S3 API port
+      - "9001:9001"       # Web Dashboard port
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - bigdata-net
+
+  # --- HADOOP NAMENODE ---
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    ports:
+      - "9870:9870"       # Hadoop Web UI
+    environment:
+      - CLUSTER_NAME=test-cluster
+    env_file:
+      - ./hadoop.env
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    networks:
+      - bigdata-net
+
+  # --- HADOOP DATANODE ---
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    depends_on:
+      - namenode
+    env_file:
+      - ./hadoop.env
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    networks:
+      - bigdata-net
+
+  # --- HIVE METASTORE DATABASE ---
+  hive-metastore-db:
+    image: postgres:13
+    container_name: hive-metastore-db
+    environment:
+      - POSTGRES_DB=metastore_db
+      - POSTGRES_USER=hive
+      - POSTGRES_PASSWORD=hive
+    volumes:
+      - hive_db_data:/var/lib/postgresql/data
+    networks:
+      - bigdata-net
+
+  # --- HIVE SERVER2 & METASTORE ---
+  hive-server:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-server
+    depends_on:
+      - namenode
+      - hive-metastore-db
+    ports:
+      - "10000:10000"     # Hive JDBC Connection
+      - "10002:10002"     # Hive Web UI
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionURL=jdbc:postgresql://hive-metastore-db:5432/metastore_db
+    networks:
+      - bigdata-net
+
+volumes:
+  minio_data:
+  hadoop_namenode:
+  hadoop_datanode:
+  hive_db_data:
