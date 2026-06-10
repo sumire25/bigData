@@ -1,0 +1,27 @@
+# Terraform specific
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Ansible specific
+*.retry
+
+# Security / Keys
+*.pem
+*.rsa
+*.pub
+id_rsa
+/tmp/master_key.pub
+
+# OS generated files
+.DS_Store

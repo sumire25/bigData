@@ -1,0 +1,23 @@
+# Terraform specific
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Security / Keys
+*.pem
+*.rsa
+*.pub
+id_rsa
+
+# OS generated files
+.DS_Store
